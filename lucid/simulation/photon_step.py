@@ -6,6 +6,14 @@ from lucid.simulation.optics import (
     sample_scatter_distance, compute_scatter_direction,
 )
 
+from lucid.AbsorptionSIREN.siren_model import apply_model, build_model
+from lucid.AbsorptionSIREN.siren_loader import encode_cylindrical
+siren_model = build_model()
+N_evals=2
+ts = jnp.linspace(0.0, 1.0, N_evals+2)[1:-1, None]  # (N_evals, 1)
+R=16
+H=38
+
 # Photon iteration functions (12-arg signatures: dual reflection, no tau_gs)
 # ===================================================================
 
@@ -13,7 +21,7 @@ def photon_iteration_sample(
         position, direction, time, surface_distance,
         normal, scatter_length, wall_reflection_rate, sensor_reflection_rate,
         absorption_length,
-        hit_sensor, rng_key, speed_of_light):
+        hit_sensor, rng_key, speed_of_light, siren_params=None):
     """
     Sampling version of photon iteration that makes binary decisions.
 
@@ -86,10 +94,11 @@ def photon_iteration_sample(
     # The rule of thumb is that epsilon needs to go down/up proportionally to the detector size.
     epsilon = 1e-4
     inward_normal = -normal  # geometry normals point outward; negate to get into-medium direction
+    dir_norm = normalize(direction)
     new_pos = jnp.where(
         scatters,
-        position + scatter_distance * normalize(direction),
-        position + surface_distance * normalize(direction) + epsilon * normalize(inward_normal),
+        position + scatter_distance * dir_norm,
+        position + surface_distance * dir_norm + epsilon * normalize(inward_normal),
     )
 
     specular_dir = compute_reflection_direction(direction, normal)
@@ -107,7 +116,15 @@ def photon_iteration_sample(
     new_time = time + distance_traveled / speed_of_light
 
     # Binary absorption sampling (Bernoulli)
-    survival_prob = jnp.exp(-distance_traveled / absorption_length)
+    inv_corr = 1
+    if siren_params is not None:
+        sampled_points = position[None, :] + ts * (distance_traveled * dir_norm)[None, :]  # (N_evals, 3)
+        corrections = apply_model(siren_model, siren_params, encode_cylindrical(sampled_points, R, H))
+        inv_corr = jnp.mean(1 / corrections)
+    eff_mu = inv_corr / absorption_length
+
+    exp_arg = jnp.clip(-distance_traveled * eff_mu, -60.0, 0.0)
+    survival_prob = jnp.exp(exp_arg)
     u_absorption = jax.random.uniform(k3)
     survives_absorption = u_absorption < survival_prob
     attenuation = survives_absorption.astype(jnp.float32)
@@ -123,7 +140,7 @@ def photon_iteration_update_factors(
         position, direction, time, surface_distance,
         normal, scatter_length, wall_reflection_rate, sensor_reflection_rate,
         absorption_length,
-        hit_sensor, rng_key, speed_of_light):
+        hit_sensor, rng_key, speed_of_light, siren_params=None):
     """
     Expected-value photon update with Straight-Through Estimator (STE).
 
@@ -183,8 +200,33 @@ def photon_iteration_update_factors(
     reflect_prob = reach_surface_prob * reflection_rate
     detect_prob = reach_surface_prob * (1 - reflection_rate)
 
-    reflection_attenuation = jnp.exp(-surface_distance / absorption_length)
-    scatter_attenuation = jnp.exp(-scatter_distance / absorption_length)
+    inv_corr_reflection = 1
+    inv_corr_scatter    = 1
+    dir_norm = normalize(direction)
+    if siren_params is not None:
+        
+        # Sample points along the direction
+        pts_refl = position[None, :] + ts * (surface_distance * dir_norm)[None, :]
+        pts_scat = position[None, :] + ts * (scatter_distance * dir_norm)[None, :]
+        
+        # Only one batch for one call of apply_model
+        pts_all = jnp.concatenate([pts_refl, pts_scat], axis=0)  # (2*N_evals, 3)
+        enc_all = encode_cylindrical(pts_all, R, H)
+        corr_all = apply_model(siren_model, siren_params, enc_all)
+        
+        corrections_reflection = corr_all[:N_evals]
+        corrections_scatter    = corr_all[N_evals:]
+        
+        inv_corr_reflection = jnp.mean(1 / corrections_reflection)
+        inv_corr_scatter    = jnp.mean(1 / corrections_scatter)
+
+    eff_mu_reflection = inv_corr_reflection / absorption_length
+    eff_mu_scatter = inv_corr_scatter / absorption_length
+    
+    exp_arg_reflection = jnp.clip(-surface_distance * eff_mu_reflection, -60.0, 0.0)
+    reflection_attenuation = jnp.exp(exp_arg_reflection)
+    exp_arg_scatter = jnp.clip(-scatter_distance * eff_mu_scatter, -60.0, 0.0)
+    scatter_attenuation = jnp.exp(exp_arg_scatter)
 
     # Straight-Through Estimator for action selection:
     # Sample discrete action, but let soft probabilities flow in backward pass
@@ -211,8 +253,8 @@ def photon_iteration_update_factors(
     # Stop-gradient here removes that compounding while keeping the forward value unchanged.
     normal_refl = jax.lax.stop_gradient(normal)
     inward_normal = -normal_refl  # into-medium direction, gradient-detached for reflection path
-    surface_pos = position + surface_distance * normalize(direction) + epsilon * normalize(inward_normal)
-    scatter_pos = position + scatter_distance * normalize(direction)
+    surface_pos = position + surface_distance * dir_norm + epsilon * normalize(inward_normal)
+    scatter_pos = position + scatter_distance * dir_norm
 
     specular_dir = compute_reflection_direction(direction, normal_refl)
     diffuse_dir = sample_cosine_hemisphere(inward_normal, k3)
@@ -239,27 +281,27 @@ def photon_iteration_update_factors_safe(
         position, direction, time, surface_distance,
         normal, scatter_length, wall_reflection_rate, sensor_reflection_rate,
         absorption_length,
-        hit_sensor, rng_key, speed_of_light):
+        hit_sensor, rng_key, speed_of_light, siren_params=None):
     return photon_iteration_update_factors(
         position, direction, time, surface_distance,
         normal, scatter_length, wall_reflection_rate, sensor_reflection_rate,
         absorption_length,
-        hit_sensor, rng_key, speed_of_light)
+        hit_sensor, rng_key, speed_of_light, siren_params)
 
 
 def _fwd(position, direction, time, surface_distance,
          normal, scatter_length, wall_reflection_rate, sensor_reflection_rate,
          absorption_length,
-         hit_sensor, rng_key, speed_of_light):
+         hit_sensor, rng_key, speed_of_light, siren_params):
     outputs = photon_iteration_update_factors(
         position, direction, time, surface_distance,
         normal, scatter_length, wall_reflection_rate, sensor_reflection_rate,
         absorption_length,
-        hit_sensor, rng_key, speed_of_light)
+        hit_sensor, rng_key, speed_of_light, siren_params)
     residuals = (position, direction, time, surface_distance,
                  normal, scatter_length, wall_reflection_rate, sensor_reflection_rate,
                  absorption_length,
-                 hit_sensor, rng_key, speed_of_light)
+                 hit_sensor, rng_key, speed_of_light, siren_params)
     return outputs, residuals
 
 

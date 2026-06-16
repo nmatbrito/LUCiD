@@ -63,6 +63,8 @@ def setup_event_simulator(
         pos_grad_threshold=None,  # None → use mode default (calib:K, track:0)
         waveform_config=None,
         wavelength_sampling='cherenkov',
+        siren_params=None,
+        siren_chunk_size=10_000,
         **grid_params):
     """
     Set up and return an event simulator using DetectorParams / ParticleParams.
@@ -174,6 +176,10 @@ def setup_event_simulator(
         detector_type=detector_type,
         **grid_params)
 
+    # Dimensions du détecteur
+    #R = float(det_geom.detector.r)
+    #H = float(det_geom.detector.r)
+
     mode = 'data' if is_data else ('calibration' if is_calibration else 'track')
     sim_config = SimConfig(
         n_photons=n_photons, K=K, mode=mode,
@@ -201,6 +207,7 @@ def setup_event_simulator(
                 f"qe_corrections has {len(qe_corr)} elements "
                 f"but detector has {NUM_SENSORS} sensors")
 
+    sample_mode = True
     # ---- Select photon update function --------------------------------------
     if sim_config.is_data:
         photon_update_fn = photon_iteration_sample
@@ -208,6 +215,7 @@ def setup_event_simulator(
         photon_update_fn = photon_iteration_sample
     else:
         photon_update_fn = jax.remat(photon_iteration_update_factors_safe)
+        sample_mode = False
 
     # ---- Geometry bounds check (delegates to detector method) ----------------
     def get_inside_detector_flag(positions):
@@ -428,6 +436,7 @@ def setup_event_simulator(
         wall_reflection_rate = detector_params.wall_reflection_rate
         sensor_reflection_rate = detector_params.sensor_reflection_rate
         qe_corrections = detector_params.qe_corrections
+        siren_params  = detector_params.siren_params
 
         from lucid.simulation.types import PhotonState
 
@@ -450,20 +459,83 @@ def setup_event_simulator(
 
             key, subkey = jax.random.split(key)
             rng_keys = jax.random.split(subkey, n_rays)
-
-            # vmap: 12 args — per-photon scatter/absorption, scalar reflections
-            (new_positions, new_directions, new_times,
-             detect_probs, reflection_attenuations,
-             continuing_factors) = jax.vmap(
-                photon_update_fn,
-                in_axes=(0, 0, 0, 0, 0,
-                         0, None, None, 0,
-                         0, 0, None)
-            )(state.positions, state.directions, state.times,
-              surface_distances, normals,
-              scatter_lengths, wall_reflection_rate, sensor_reflection_rate,
-              absorption_lengths,
-              hit_sensor, rng_keys, SPEED_OF_LIGHT_MATERIAL)
+            if siren_params is None:
+                # ---- Homogeneous: single vmap over all photons --------------
+                (new_positions, new_directions, new_times,
+                 detect_probs, reflection_attenuations,
+                 continuing_factors) = jax.vmap(
+                    photon_update_fn,
+                    in_axes=(0, 0, 0, 0, 0,
+                             0, None, None, 0,
+                             0, 0, None)
+                )(state.positions, state.directions, state.times,
+                  surface_distances, normals,
+                  scatter_lengths, wall_reflection_rate, sensor_reflection_rate,
+                  absorption_lengths,
+                  hit_sensor, rng_keys, SPEED_OF_LIGHT_MATERIAL)
+ 
+            else:
+                # ---- SIREN: chunked vmaps to limit peak memory --------------
+                # Each chunk runs vmap(photon_update_fn) on chunk_size photons.
+                # Inside photon_update_fn, siren_params is broadcast (in_axes=None)
+                # and apply_model is called on N_evals points — so peak memory
+                # per chunk ≈ chunk_size * N_evals * 3 floats, not n_rays * N_evals * 3.
+                n_chunks = (n_rays + siren_chunk_size - 1) // siren_chunk_size
+                pad      = n_chunks * siren_chunk_size - n_rays
+ 
+                def _pad(x):
+                    return jnp.concatenate(
+                        [x, jnp.zeros((pad,) + x.shape[1:], x.dtype)], axis=0)
+ 
+                # Pad all per-photon arrays to n_chunks * siren_chunk_size
+                pos_pad  = _pad(state.positions)
+                dir_pad  = _pad(state.directions)
+                t_pad    = _pad(state.times)
+                sd_pad   = _pad(surface_distances)
+                norm_pad = _pad(normals)
+                sl_pad   = _pad(scatter_lengths)
+                al_pad   = _pad(absorption_lengths)
+                hs_pad   = _pad(hit_sensor.astype(jnp.float32)).astype(bool)
+                rk_pad   = jnp.concatenate(
+                    [rng_keys, jnp.zeros((pad, 2), rng_keys.dtype)], axis=0)
+ 
+                # Reshape to (n_chunks, siren_chunk_size, ...)
+                cs = siren_chunk_size
+                pos_c  = pos_pad.reshape(n_chunks, cs, 3)
+                dir_c  = dir_pad.reshape(n_chunks, cs, 3)
+                t_c    = t_pad.reshape(n_chunks, cs)
+                sd_c   = sd_pad.reshape(n_chunks, cs)
+                norm_c = norm_pad.reshape(n_chunks, cs, 3)
+                sl_c   = sl_pad.reshape(n_chunks, cs)
+                al_c   = al_pad.reshape(n_chunks, cs)
+                hs_c   = hs_pad.reshape(n_chunks, cs)
+                rk_c   = rk_pad.reshape(n_chunks, cs, 2)
+ 
+                def process_chunk(chunk_inputs):
+                    (pos_ch, dir_ch, t_ch, sd_ch, norm_ch,
+                     sl_ch, al_ch, hs_ch, rk_ch) = chunk_inputs
+                    return jax.vmap(
+                        photon_update_fn,
+                        in_axes=(0, 0, 0, 0, 0,
+                                 0, None, None, 0,
+                                 0, 0, None, None)
+                    )(pos_ch, dir_ch, t_ch, sd_ch, norm_ch,
+                      sl_ch, wall_reflection_rate, sensor_reflection_rate,
+                      al_ch,
+                      hs_ch, rk_ch, SPEED_OF_LIGHT_MATERIAL, siren_params)
+ 
+                # lax.map = sequential loop: one chunk in memory at a time
+                chunk_out = jax.lax.map(
+                    process_chunk,
+                    (pos_c, dir_c, t_c, sd_c, norm_c, sl_c, al_c, hs_c, rk_c))
+ 
+                # chunk_out: tuple of (n_chunks, cs, ...) — flatten and unpad
+                (new_positions, new_directions, new_times,
+                 detect_probs, reflection_attenuations,
+                 continuing_factors) = tuple(
+                    x.reshape(n_chunks * cs, *x.shape[2:])[:n_rays]
+                    for x in chunk_out)
+                    
 
             inside_detector = get_inside_detector_flag(new_positions)
             safe_continuing = jnp.where(inside_detector, continuing_factors, 0.0)
@@ -732,3 +804,4 @@ def setup_event_simulator(
             return partial(_simulation_without_data_impl,
                            grid_data=grid_data,
                            model_params=model_params)
+

@@ -54,7 +54,7 @@ class DetectorParams(NamedTuple):
     absorption_length: jnp.ndarray
     qe: jnp.ndarray
     qe_corrections: jnp.ndarray
-
+    siren_params: object = None
 
 # ---------------------------------------------------------------------------
 # ParticleParams
@@ -126,6 +126,8 @@ def save_detector_params(params: DetectorParams, filepath: str):
     stem = os.path.splitext(os.path.basename(filepath))[0]
     data = {}
     for field in DetectorParams._fields:
+        if field == "siren_params":
+            continue
         val = getattr(params, field)
         arr = np.asarray(val)
         if arr.ndim == 0:
@@ -176,7 +178,8 @@ def _project_missing_scalars(kwargs, medium_path, qe_path, ref_wavelength_nm,
     available to project from.
     """
     for field in _PROJECTABLE_FIELDS:
-        v = kwargs[field]
+        #v = kwargs[field]
+        v = kwargs.get(field, jnp.array(jnp.nan))
         if v.ndim != 0 or not bool(jnp.isnan(v)):
             continue
 
@@ -266,6 +269,9 @@ def load_physics_config(filepath: str, num_sensors: int = None,
 
     kwargs = {}
     for field in DetectorParams._fields:
+        if field == "siren_params":
+            kwargs[field] = None
+            continue
         val = data.get(field, None)
         kwargs[field] = _resolve_field(val, config_dir)
 
@@ -314,6 +320,9 @@ def load_particle_params(filepath: str) -> ParticleParams:
 # Optimization helpers
 # ---------------------------------------------------------------------------
 
+"""
+Original normalize function
+"""
 def normalize_params(params, bounds_min, bounds_max):
     """Map a pytree from physical units to [0, 1] using element-wise bounds."""
     return jax.tree.map(
@@ -321,13 +330,76 @@ def normalize_params(params, bounds_min, bounds_max):
         params, bounds_min, bounds_max,
     )
 
+"""
+Normalize parameters without touching the SIREN parameters
+"""
+def normalize_params(params, bounds_min, bounds_max):
 
+    PHYSICAL_FIELDS = {
+        'scatter_length',
+        'wall_reflection_rate',
+        'sensor_reflection_rate',
+        'absorption_length',
+    }
+
+    kwargs = {}
+
+    for field in params._fields:
+
+        val = getattr(params, field)
+
+        if field in PHYSICAL_FIELDS:
+            lo = getattr(bounds_min, field)
+            hi = getattr(bounds_max, field)
+
+            kwargs[field] = (val - lo) / (hi - lo + 1e-8)
+
+        else:
+            # qe / qe_corrections / siren_params untouched
+            kwargs[field] = val
+
+    return type(params)(**kwargs)
+
+"""
+Original denormalize function
+"""
 def denormalize_params(normalized, bounds_min, bounds_max):
     """Map a pytree from [0, 1] back to physical units."""
     return jax.tree.map(
         lambda v, lo, hi: v * (hi - lo) + lo,
         normalized, bounds_min, bounds_max,
     )
+
+"""
+Denormalize parameters without touching the SIREN parameters
+"""
+def denormalize_params(normalized, bounds_min, bounds_max):
+
+
+    PHYSICAL_FIELDS = {
+        'scatter_length',
+        'wall_reflection_rate',
+        'sensor_reflection_rate',
+        'absorption_length',
+    }
+
+    kwargs = {}
+
+    for field in normalized._fields:
+
+        val = getattr(normalized, field)
+
+        if field in PHYSICAL_FIELDS:
+
+            lo = getattr(bounds_min, field)
+            hi = getattr(bounds_max, field)
+
+            kwargs[field] = val * (hi - lo) + lo
+
+        else:
+            kwargs[field] = val
+
+    return type(normalized)(**kwargs)
 
 
 def default_bounds(num_sensors: int):
@@ -344,6 +416,7 @@ def default_bounds(num_sensors: int):
         absorption_length=jnp.array(0.0),
         qe=jnp.array(0.0),
         qe_corrections=jnp.zeros(num_sensors),
+        siren_params=None,
     )
     bounds_max = DetectorParams(
         scatter_length=jnp.array(100.0),
@@ -352,6 +425,7 @@ def default_bounds(num_sensors: int):
         absorption_length=jnp.array(500.0),
         qe=jnp.array(1.0),
         qe_corrections=jnp.full(num_sensors, 2.0),
+        siren_params=None,
     )
     return bounds_min, bounds_max
 
@@ -382,6 +456,28 @@ def make_optimization_mask(params, trainable_fields):
     return type(params)(**mask_dict)
 
 
+def make_optimization_mask(params, trainable_fields):
+
+    mask_dict = {}
+
+    for field in params._fields:
+
+        val = getattr(params, field)
+
+        if val is None:
+            mask_dict[field] = None
+            continue
+
+        trainable = field in trainable_fields
+
+        mask_dict[field] = jax.tree.map(
+            lambda _: trainable,
+            val
+        )
+
+    return type(params)(**mask_dict)
+
+
 def create_default_detector_params(num_sensors: int) -> DetectorParams:
     """Sensible initialization defaults for calibration optimization."""
     return DetectorParams(
@@ -391,6 +487,7 @@ def create_default_detector_params(num_sensors: int) -> DetectorParams:
         absorption_length=jnp.array(150.0),
         qe=jnp.array(0.2),
         qe_corrections=jnp.ones(num_sensors),
+        siren_params=None
     )
 
 
