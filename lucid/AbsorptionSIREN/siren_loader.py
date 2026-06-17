@@ -116,8 +116,8 @@ def setup_siren(
 
 def encode_cylindrical(
     xyz: jnp.ndarray,
-    R: float = 16.9,
-    H: float = 38.0,
+    R: float = 16.96228024518598,
+    H: float = 36.37842222222,
 ) -> jnp.ndarray:
     """Converts Cartesian coordinates (N, 3) to SIREN input (N, 4).
 
@@ -155,8 +155,8 @@ def encode_cylindrical(
 def make_absorption_fn(
     model: SIREN,
     #params: dict,
-    R: float = 16.9,
-    H: float = 38.0,
+    R: float = 16.96228024518598,
+    H: float = 36.37842222222,
     base_absorption: float = 1.0,
     output_scale: float = 5.0,
     output_shift: float = 1.0,

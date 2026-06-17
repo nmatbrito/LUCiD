@@ -178,7 +178,7 @@ def setup_event_simulator(
 
     # Dimensions du détecteur
     #R = float(det_geom.detector.r)
-    #H = float(det_geom.detector.r)
+    #H = float(det_geom.detector.H)
 
     mode = 'data' if is_data else ('calibration' if is_calibration else 'track')
     sim_config = SimConfig(

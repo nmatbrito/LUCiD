@@ -11,8 +11,8 @@ from lucid.AbsorptionSIREN.siren_loader import encode_cylindrical
 siren_model = build_model()
 N_evals=2
 ts = jnp.linspace(0.0, 1.0, N_evals+2)[1:-1, None]  # (N_evals, 1)
-R=16
-H=38
+R=16.96228024518598
+H=36.37842222222
 
 # Photon iteration functions (12-arg signatures: dual reflection, no tau_gs)
 # ===================================================================
@@ -119,8 +119,9 @@ def photon_iteration_sample(
     inv_corr = 1
     if siren_params is not None:
         sampled_points = position[None, :] + ts * (distance_traveled * dir_norm)[None, :]  # (N_evals, 3)
-        corrections = apply_model(siren_model, siren_params, encode_cylindrical(sampled_points, R, H))
+        corrections = apply_model(siren_model, siren_params, encode_cylindrical(sampled_points, R, H))/5+1
         inv_corr = jnp.mean(1 / corrections)
+    #jax.debug.print("inv_corr: {x}", x=inv_corr)
     eff_mu = inv_corr / absorption_length
 
     exp_arg = jnp.clip(-distance_traveled * eff_mu, -60.0, 0.0)
@@ -212,7 +213,7 @@ def photon_iteration_update_factors(
         # Only one batch for one call of apply_model
         pts_all = jnp.concatenate([pts_refl, pts_scat], axis=0)  # (2*N_evals, 3)
         enc_all = encode_cylindrical(pts_all, R, H)
-        corr_all = apply_model(siren_model, siren_params, enc_all)
+        corr_all = apply_model(siren_model, siren_params, enc_all)/5+1
         
         corrections_reflection = corr_all[:N_evals]
         corrections_scatter    = corr_all[N_evals:]
@@ -221,6 +222,7 @@ def photon_iteration_update_factors(
         inv_corr_scatter    = jnp.mean(1 / corrections_scatter)
 
     eff_mu_reflection = inv_corr_reflection / absorption_length
+    #jax.debug.print("inv_corr_reflection: {x}", x=inv_corr_reflection)
     eff_mu_scatter = inv_corr_scatter / absorption_length
     
     exp_arg_reflection = jnp.clip(-surface_distance * eff_mu_reflection, -60.0, 0.0)
